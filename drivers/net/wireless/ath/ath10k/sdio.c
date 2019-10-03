@@ -23,6 +23,11 @@
 #include "targaddrs.h"
 #include "trace.h"
 #include "sdio.h"
+#include "coredump.h"
+
+void ath10k_sdio_fw_crashed_dump(struct ath10k *ar);
+
+#define ATH10K_SDIO_VSG_BUF_SIZE	(64 * 1024)
 
 /* inlined helper functions */
 
@@ -417,6 +422,7 @@ static int ath10k_sdio_mbox_rx_process_packets(struct ath10k *ar,
 	struct ath10k_htc *htc = &ar->htc;
 	struct ath10k_sdio_rx_data *pkt;
 	struct ath10k_htc_ep *ep;
+	struct ath10k_skb_cb *cb;
 	enum ath10k_htc_ep_id id;
 	int ret, i, *n_lookahead_local;
 	u32 *lookaheads_local;
@@ -462,10 +468,16 @@ static int ath10k_sdio_mbox_rx_process_packets(struct ath10k *ar,
 		if (ret)
 			goto out;
 
-		if (!pkt->trailer_only)
-			ep->ep_ops.ep_rx_complete(ar_sdio->ar, pkt->skb);
-		else
+		if (!pkt->trailer_only) {
+			cb = ATH10K_SKB_CB(pkt->skb);
+			cb->eid = id;
+
+			skb_queue_tail(&ar_sdio->rx_head, pkt->skb);
+			queue_work(ar->workqueue_aux,
+				   &ar_sdio->async_work_rx);
+		} else {
 			kfree_skb(pkt->skb);
+		}
 
 		/* The RX complete handler now owns the skb...*/
 		pkt->skb = NULL;
@@ -484,15 +496,15 @@ out:
 	return ret;
 }
 
-static int ath10k_sdio_mbox_alloc_pkt_bundle(struct ath10k *ar,
-					     struct ath10k_sdio_rx_data *rx_pkts,
-					     struct ath10k_htc_hdr *htc_hdr,
-					     size_t full_len, size_t act_len,
-					     size_t *bndl_cnt)
+static int ath10k_sdio_mbox_alloc_bundle(struct ath10k *ar,
+					 struct ath10k_sdio_rx_data *rx_pkts,
+					 struct ath10k_htc_hdr *htc_hdr,
+					 size_t full_len, size_t act_len,
+					 size_t *bndl_cnt)
 {
 	int ret, i;
 
-	*bndl_cnt = FIELD_GET(ATH10K_HTC_FLAG_BUNDLE_MASK, htc_hdr->flags);
+	*bndl_cnt = ATH10K_HTC_GET_BUNDLE_COUNT(htc_hdr->flags);
 
 	if (*bndl_cnt > HTC_HOST_MAX_MSG_PER_RX_BUNDLE) {
 		ath10k_warn(ar,
@@ -529,6 +541,7 @@ static int ath10k_sdio_mbox_rx_alloc(struct ath10k *ar,
 	size_t full_len, act_len;
 	bool last_in_bundle;
 	int ret, i;
+	int pkt_cnt = 0;
 
 	if (n_lookaheads > ATH10K_SDIO_MAX_RX_MSGS) {
 		ath10k_warn(ar,
@@ -572,20 +585,19 @@ static int ath10k_sdio_mbox_rx_alloc(struct ath10k *ar,
 			 */
 			size_t bndl_cnt;
 
-			ret = ath10k_sdio_mbox_alloc_pkt_bundle(ar,
-								&ar_sdio->rx_pkts[i],
-								htc_hdr,
-								full_len,
-								act_len,
-								&bndl_cnt);
+			ret = ath10k_sdio_mbox_alloc_bundle(ar,
+							    &ar_sdio->rx_pkts[pkt_cnt],
+							    htc_hdr,
+							    full_len,
+							    act_len,
+							    &bndl_cnt);
 
 			if (ret) {
 				ath10k_warn(ar, "alloc_bundle error %d\n", ret);
 				goto err;
 			}
 
-			n_lookaheads += bndl_cnt;
-			i += bndl_cnt;
+			pkt_cnt += bndl_cnt;
 			/*Next buffer will be the last in the bundle */
 			last_in_bundle = true;
 		}
@@ -597,7 +609,7 @@ static int ath10k_sdio_mbox_rx_alloc(struct ath10k *ar,
 		if (htc_hdr->flags & ATH10K_HTC_FLAGS_RECV_1MORE_BLOCK)
 			full_len += ATH10K_HIF_MBOX_BLOCK_SIZE;
 
-		ret = ath10k_sdio_mbox_alloc_rx_pkt(&ar_sdio->rx_pkts[i],
+		ret = ath10k_sdio_mbox_alloc_rx_pkt(&ar_sdio->rx_pkts[pkt_cnt],
 						    act_len,
 						    full_len,
 						    last_in_bundle,
@@ -606,9 +618,11 @@ static int ath10k_sdio_mbox_rx_alloc(struct ath10k *ar,
 			ath10k_warn(ar, "alloc_rx_pkt error %d\n", ret);
 			goto err;
 		}
+
+		pkt_cnt++;
 	}
 
-	ar_sdio->n_rx_pkts = i;
+	ar_sdio->n_rx_pkts = pkt_cnt;
 
 	return 0;
 
@@ -622,58 +636,75 @@ err:
 	return ret;
 }
 
-static int ath10k_sdio_mbox_rx_packet(struct ath10k *ar,
-				      struct ath10k_sdio_rx_data *pkt)
+static int ath10k_sdio_mbox_rx_fetch(struct ath10k *ar)
 {
 	struct ath10k_sdio *ar_sdio = ath10k_sdio_priv(ar);
+	struct ath10k_sdio_rx_data *pkt = &ar_sdio->rx_pkts[0];
 	struct sk_buff *skb = pkt->skb;
 	struct ath10k_htc_hdr *htc_hdr;
 	int ret;
 
 	ret = ath10k_sdio_readsb(ar, ar_sdio->mbox_info.htc_addr,
 				 skb->data, pkt->alloc_len);
-	if (ret)
-		goto out;
 
-	/* Update actual length. The original length may be incorrect,
-	 * as the FW will bundle multiple packets as long as their sizes
-	 * fit within the same aligned length (pkt->alloc_len).
-	 */
-	htc_hdr = (struct ath10k_htc_hdr *)skb->data;
-	pkt->act_len = le16_to_cpu(htc_hdr->len) + sizeof(*htc_hdr);
-	if (pkt->act_len > pkt->alloc_len) {
-		ath10k_warn(ar, "rx packet too large (%zu > %zu)\n",
-			    pkt->act_len, pkt->alloc_len);
-		ret = -EMSGSIZE;
-		goto out;
+	if (ret) {
+		ar_sdio->n_rx_pkts = 0;
+		ath10k_sdio_mbox_free_rx_pkt(pkt);
+		return ret;
 	}
 
-	skb_put(skb, pkt->act_len);
-
-out:
+	htc_hdr = (struct ath10k_htc_hdr *)skb->data;
+	pkt->act_len = le16_to_cpu(htc_hdr->len) + sizeof(*htc_hdr);
 	pkt->status = ret;
+	skb_put(skb, pkt->act_len);
 
 	return ret;
 }
 
-static int ath10k_sdio_mbox_rx_fetch(struct ath10k *ar)
+static int ath10k_sdio_mbox_rx_fetch_bundle(struct ath10k *ar)
 {
 	struct ath10k_sdio *ar_sdio = ath10k_sdio_priv(ar);
+	struct ath10k_sdio_rx_data *pkt;
+	struct ath10k_htc_hdr *htc_hdr;
 	int ret, i;
+	u32 pkt_offset, virt_pkt_len;
 
+	virt_pkt_len = 0;
+	for (i = 0; i < ar_sdio->n_rx_pkts; i++)
+		virt_pkt_len += ar_sdio->rx_pkts[i].alloc_len;
+
+	if (virt_pkt_len > ATH10K_SDIO_VSG_BUF_SIZE) {
+		ath10k_err(ar, "size exceeding limit %d\n", virt_pkt_len);
+		ret = -E2BIG;
+		goto err;
+	}
+
+	ret = ath10k_sdio_readsb(ar, ar_sdio->mbox_info.htc_addr,
+				 ar_sdio->vsg_buffer, virt_pkt_len);
+	if (ret) {
+		ath10k_warn(ar, "failed to read bundle packets: %d", ret);
+		goto err;
+	}
+
+	pkt_offset = 0;
 	for (i = 0; i < ar_sdio->n_rx_pkts; i++) {
-		ret = ath10k_sdio_mbox_rx_packet(ar,
-						 &ar_sdio->rx_pkts[i]);
-		if (ret)
-			goto err;
+		pkt = &ar_sdio->rx_pkts[i];
+		htc_hdr = (struct ath10k_htc_hdr *)(ar_sdio->vsg_buffer + pkt_offset);
+		pkt->act_len = le16_to_cpu(htc_hdr->len) + sizeof(*htc_hdr);
+
+		skb_put_data(pkt->skb, htc_hdr, pkt->act_len);
+		pkt->status = 0;
+		pkt_offset += pkt->alloc_len;
 	}
 
 	return 0;
 
 err:
 	/* Free all packets that was not successfully fetched. */
-	for (; i < ar_sdio->n_rx_pkts; i++)
+	for (i = 0; i < ar_sdio->n_rx_pkts; i++)
 		ath10k_sdio_mbox_free_rx_pkt(&ar_sdio->rx_pkts[i]);
+
+	ar_sdio->n_rx_pkts = 0;
 
 	return ret;
 }
@@ -717,7 +748,10 @@ static int ath10k_sdio_mbox_rxmsg_pending_handler(struct ath10k *ar,
 			 */
 			*done = false;
 
-		ret = ath10k_sdio_mbox_rx_fetch(ar);
+		if (ar_sdio->n_rx_pkts > 1)
+			ret = ath10k_sdio_mbox_rx_fetch_bundle(ar);
+		else
+			ret = ath10k_sdio_mbox_rx_fetch(ar);
 
 		/* Process fetched packets. This will potentially update
 		 * n_lookaheads depending on if the packets contain lookahead
@@ -872,10 +906,9 @@ static int ath10k_sdio_mbox_proc_cpu_intr(struct ath10k *ar)
 
 out:
 	mutex_unlock(&irq_data->mtx);
-	if (cpu_int_status & MBOX_CPU_STATUS_ENABLE_ASSERT_MASK) {
-		ath10k_err(ar, "firmware crashed!\n");
-		queue_work(ar->workqueue, &ar->restart_work);
-	}
+	if (cpu_int_status & MBOX_CPU_STATUS_ENABLE_ASSERT_MASK)
+		ath10k_sdio_fw_crashed_dump(ar);
+
 	return ret;
 }
 
@@ -1263,6 +1296,7 @@ static void ath10k_sdio_free_bus_req(struct ath10k *ar,
 {
 	struct ath10k_sdio *ar_sdio = ath10k_sdio_priv(ar);
 
+	kfree(bus_req->buf);
 	memset(bus_req, 0, sizeof(*bus_req));
 
 	spin_lock_bh(&ar_sdio->lock);
@@ -1278,7 +1312,7 @@ static void __ath10k_sdio_write_async(struct ath10k *ar,
 	int ret;
 
 	skb = req->skb;
-	ret = ath10k_sdio_write(ar, req->address, skb->data, skb->len);
+	ret = ath10k_sdio_write(ar, req->address, req->buf, req->buf_len);
 	if (ret)
 		ath10k_warn(ar, "failed to write skb to 0x%x asynchronously: %d",
 			    req->address, ret);
@@ -1291,6 +1325,25 @@ static void __ath10k_sdio_write_async(struct ath10k *ar,
 	}
 
 	ath10k_sdio_free_bus_req(ar, req);
+}
+
+static void ath10k_rx_indication_async_work(struct work_struct *work)
+{
+	struct ath10k_sdio *ar_sdio = container_of(work, struct ath10k_sdio,
+						   async_work_rx);
+	struct ath10k *ar = ar_sdio->ar;
+	struct ath10k_htc_ep *ep;
+	struct ath10k_skb_cb *cb;
+	struct sk_buff *skb;
+
+	while (true) {
+		skb = skb_dequeue(&ar_sdio->rx_head);
+		if (!skb)
+			break;
+		cb = ATH10K_SKB_CB(skb);
+		ep = &ar->htc.endpoint[cb->eid];
+		ep->ep_ops.ep_rx_complete(ar, skb);
+	}
 }
 
 static void ath10k_sdio_write_async_work(struct work_struct *work)
@@ -1314,6 +1367,7 @@ static void ath10k_sdio_write_async_work(struct work_struct *work)
 
 static int ath10k_sdio_prep_async_req(struct ath10k *ar, u32 addr,
 				      struct sk_buff *skb,
+				      size_t alloc_len,
 				      struct completion *comp,
 				      bool htc_msg, enum ath10k_htc_ep_id eid)
 {
@@ -1327,9 +1381,17 @@ static int ath10k_sdio_prep_async_req(struct ath10k *ar, u32 addr,
 	if (!bus_req) {
 		ath10k_warn(ar,
 			    "unable to allocate bus request for async request\n");
-		return -ENOMEM;
+		goto err;
 	}
 
+	bus_req->buf_len = alloc_len;
+	bus_req->buf = kzalloc(alloc_len, GFP_NOFS);
+	if (!bus_req->buf) {
+		ath10k_warn(ar,
+			    "unable to allocate data buffer for bus request\n");
+		goto err_free_bus_req;
+	}
+	memcpy(bus_req->buf, skb->data, skb->len);
 	bus_req->skb = skb;
 	bus_req->eid = eid;
 	bus_req->address = addr;
@@ -1341,6 +1403,11 @@ static int ath10k_sdio_prep_async_req(struct ath10k *ar, u32 addr,
 	spin_unlock_bh(&ar_sdio->wr_async_lock);
 
 	return 0;
+
+err_free_bus_req:
+	ath10k_sdio_free_bus_req(ar, bus_req);
+err:
+	return -ENOMEM;
 }
 
 /* IRQ handler */
@@ -1485,12 +1552,11 @@ static int ath10k_sdio_hif_tx_sg(struct ath10k *ar, u8 pipe_id,
 		skb = items[i].transfer_context;
 		padded_len = ath10k_sdio_calc_txrx_padded_len(ar_sdio,
 							      skb->len);
-		skb_trim(skb, padded_len);
 
 		/* Write TX data to the end of the mbox address space */
 		address = ar_sdio->mbox_addr[eid] + ar_sdio->mbox_size[eid] -
-			  skb->len;
-		ret = ath10k_sdio_prep_async_req(ar, address, skb,
+			  padded_len;
+		ret = ath10k_sdio_prep_async_req(ar, address, skb, padded_len,
 						 NULL, true, eid);
 		if (ret)
 			return ret;
@@ -1752,7 +1818,8 @@ static void ath10k_sdio_irq_disable(struct ath10k *ar)
 
 	init_completion(&irqs_disabled_comp);
 	ret = ath10k_sdio_prep_async_req(ar, MBOX_INT_STATUS_ENABLE_ADDRESS,
-					 skb, &irqs_disabled_comp, false, 0);
+					 skb, skb->len, &irqs_disabled_comp,
+					 false, 0);
 	if (ret)
 		goto out;
 
@@ -1980,6 +2047,334 @@ static SIMPLE_DEV_PM_OPS(ath10k_sdio_pm_ops, ath10k_sdio_pm_suspend,
 
 #endif /* CONFIG_PM_SLEEP */
 
+static int ath10k_sdio_read_host_interest_value(struct ath10k *ar,
+						u32 item_offset,
+						u32 *val)
+{
+	u32 addr;
+	int ret;
+
+	addr = host_interest_item_address(item_offset);
+
+	ret = ath10k_sdio_hif_diag_read32(ar, addr, val);
+
+	if (ret)
+		ath10k_warn(ar, "unable to read host interest offset %d value\n",
+			    item_offset);
+
+	return ret;
+}
+
+static int ath10k_sdio_read_mem(struct ath10k *ar, u32 address, void *buf,
+				u32 buf_len)
+{
+	u32 val;
+	int i, ret;
+
+	for (i = 0; i < buf_len; i += 4) {
+		ret = ath10k_sdio_hif_diag_read32(ar, address + i, &val);
+		if (ret) {
+			ath10k_warn(ar, "unable to read mem %d value\n", address + i);
+			break;
+		}
+		memcpy(buf + i, &val, 4);
+	}
+
+	return ret;
+}
+
+static void ath10k_sdio_check_fw_reg(struct ath10k *ar, u32 *fast_dump)
+{
+	u32 param;
+
+	ath10k_sdio_read_host_interest_value(ar, HI_ITEM(hi_option_flag2), &param);
+
+	*fast_dump = ((param & HI_OPTION_SDIO_CRASH_DUMP_ENHANCEMENT_FW)
+			     == HI_OPTION_SDIO_CRASH_DUMP_ENHANCEMENT_FW);
+
+	ath10k_dbg(ar, ATH10K_DBG_SDIO, "sdio hi_option_flag2 %x\n", param);
+}
+
+static void ath10k_sdio_dump_registers(struct ath10k *ar,
+				       struct ath10k_fw_crash_data *crash_data,
+				       u32 fast_dump)
+{
+	u32 reg_dump_values[REG_DUMP_COUNT_QCA988X] = {};
+	int i, ret;
+	u32 reg_dump_area;
+
+	ret = ath10k_sdio_read_host_interest_value(ar, HI_ITEM(hi_failure_state),
+						   &reg_dump_area);
+	if (ret) {
+		ath10k_err(ar, "failed to read firmware dump area: %d\n", ret);
+		return;
+	}
+
+	if (fast_dump)
+		ret = ath10k_bmi_read_memory(ar, reg_dump_area, reg_dump_values,
+					     sizeof(reg_dump_values));
+	else
+		ret = ath10k_sdio_read_mem(ar, reg_dump_area, reg_dump_values,
+					   sizeof(reg_dump_values));
+
+	if (ret) {
+		ath10k_err(ar, "failed to read firmware dump value: %d\n", ret);
+		return;
+	}
+
+	ath10k_err(ar, "firmware register dump:\n");
+	for (i = 0; i < ARRAY_SIZE(reg_dump_values); i += 4)
+		ath10k_err(ar, "[%02d]: 0x%08X 0x%08X 0x%08X 0x%08X\n",
+			   i,
+			   reg_dump_values[i],
+			   reg_dump_values[i + 1],
+			   reg_dump_values[i + 2],
+			   reg_dump_values[i + 3]);
+
+	if (!crash_data)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(reg_dump_values); i++)
+		crash_data->registers[i] = __cpu_to_le32(reg_dump_values[i]);
+}
+
+static int ath10k_sdio_dump_memory_section(struct ath10k *ar,
+					   const struct ath10k_mem_region *mem_region,
+					   u8 *buf, size_t buf_len)
+{
+	const struct ath10k_mem_section *cur_section, *next_section;
+	unsigned int count, section_size, skip_size;
+	int ret, i, j;
+
+	if (!mem_region || !buf)
+		return 0;
+
+	cur_section = &mem_region->section_table.sections[0];
+
+	if (mem_region->start > cur_section->start) {
+		ath10k_warn(ar, "incorrect memdump region 0x%x with section start address 0x%x.\n",
+			    mem_region->start, cur_section->start);
+		return 0;
+	}
+
+	skip_size = cur_section->start - mem_region->start;
+
+	/* fill the gap between the first register section and register
+	 * start address
+	 */
+	for (i = 0; i < skip_size; i++) {
+		*buf = ATH10K_MAGIC_NOT_COPIED;
+		buf++;
+	}
+
+	count = 0;
+
+	for (i = 0; cur_section; i++) {
+		section_size = cur_section->end - cur_section->start;
+
+		if (section_size <= 0) {
+			ath10k_warn(ar, "incorrect ramdump format with start address 0x%x and stop address 0x%x\n",
+				    cur_section->start,
+				    cur_section->end);
+			break;
+		}
+
+		if ((i + 1) == mem_region->section_table.size) {
+			/* last section */
+			next_section = NULL;
+			skip_size = 0;
+		} else {
+			next_section = cur_section + 1;
+
+			if (cur_section->end > next_section->start) {
+				ath10k_warn(ar, "next ramdump section 0x%x is smaller than current end address 0x%x\n",
+					    next_section->start,
+					    cur_section->end);
+				break;
+			}
+
+			skip_size = next_section->start - cur_section->end;
+		}
+
+		if (buf_len < (skip_size + section_size)) {
+			ath10k_warn(ar, "ramdump buffer is too small: %zu\n", buf_len);
+			break;
+		}
+
+		buf_len -= skip_size + section_size;
+
+		/* read section to dest memory */
+		ret = ath10k_sdio_read_mem(ar, cur_section->start,
+					   buf, section_size);
+		if (ret) {
+			ath10k_warn(ar, "failed to read ramdump from section 0x%x: %d\n",
+				    cur_section->start, ret);
+			break;
+		}
+
+		buf += section_size;
+		count += section_size;
+
+		/* fill in the gap between this section and the next */
+		for (j = 0; j < skip_size; j++) {
+			*buf = ATH10K_MAGIC_NOT_COPIED;
+			buf++;
+		}
+
+		count += skip_size;
+
+		if (!next_section)
+			/* this was the last section */
+			break;
+
+		cur_section = next_section;
+	}
+
+	return count;
+}
+
+/* if an error happened returns < 0, otherwise the length */
+static int ath10k_sdio_dump_memory_generic(struct ath10k *ar,
+					   const struct ath10k_mem_region *current_region,
+					   u8 *buf,
+					   u32 fast_dump)
+{
+	int ret;
+
+	if (current_region->section_table.size > 0)
+		/* Copy each section individually. */
+		return ath10k_sdio_dump_memory_section(ar,
+						      current_region,
+						      buf,
+						      current_region->len);
+
+	/* No individiual memory sections defined so we can
+	 * copy the entire memory region.
+	 */
+	if (fast_dump)
+		ret = ath10k_bmi_read_memory(ar,
+					     current_region->start,
+					     buf,
+					     current_region->len);
+	else
+		ret = ath10k_sdio_read_mem(ar,
+					   current_region->start,
+					   buf,
+					   current_region->len);
+
+	if (ret) {
+		ath10k_warn(ar, "failed to copy ramdump region %s: %d\n",
+			    current_region->name, ret);
+		return ret;
+	}
+
+	return current_region->len;
+}
+
+static void ath10k_sdio_dump_memory(struct ath10k *ar,
+				    struct ath10k_fw_crash_data *crash_data,
+				    u32 fast_dump)
+{
+	const struct ath10k_hw_mem_layout *mem_layout;
+	const struct ath10k_mem_region *current_region;
+	struct ath10k_dump_ram_data_hdr *hdr;
+	u32 count;
+	size_t buf_len;
+	int ret, i;
+	u8 *buf;
+
+	if (!crash_data)
+		return;
+
+	mem_layout = ath10k_coredump_get_mem_layout(ar);
+	if (!mem_layout)
+		return;
+
+	current_region = &mem_layout->region_table.regions[0];
+
+	buf = crash_data->ramdump_buf;
+	buf_len = crash_data->ramdump_buf_len;
+
+	memset(buf, 0, buf_len);
+
+	for (i = 0; i < mem_layout->region_table.size; i++) {
+		count = 0;
+
+		if (current_region->len > buf_len) {
+			ath10k_warn(ar, "memory region %s size %d is larger that remaining ramdump buffer size %zu\n",
+				    current_region->name,
+				    current_region->len,
+				    buf_len);
+			break;
+		}
+
+		/* Reserve space for the header. */
+		hdr = (void *)buf;
+		buf += sizeof(*hdr);
+		buf_len -= sizeof(*hdr);
+
+		ret = ath10k_sdio_dump_memory_generic(ar, current_region, buf, fast_dump);
+
+		ath10k_err(ar, "dump mem, name:%s, type:%d, start:0x%x, len:0x%x, size:%d, ret:0x%x\n",
+			   current_region->name,
+			   current_region->type,
+			   current_region->start,
+			   current_region->len,
+			   current_region->section_table.size,
+			   ret);
+
+		if (ret >= 0)
+			count = ret;
+
+		hdr->region_type = cpu_to_le32(current_region->type);
+		hdr->start = cpu_to_le32(current_region->start);
+		hdr->length = cpu_to_le32(count);
+
+		if (count == 0)
+			/* Note: the header remains, just with zero length. */
+			break;
+
+		buf += count;
+		buf_len -= count;
+
+		current_region++;
+	}
+}
+
+void ath10k_sdio_fw_crashed_dump(struct ath10k *ar)
+{
+	struct ath10k_fw_crash_data *crash_data;
+	char guid[UUID_STRING_LEN + 1];
+	u32 fast_dump = 0;
+
+	ath10k_err(ar, "begin fw dump\n");
+
+	ath10k_sdio_check_fw_reg(ar, &fast_dump);
+
+	if (fast_dump)
+		ar->bmi.done_sent = false;
+
+	ar->stats.fw_crash_counter++;
+
+	ath10k_sdio_hif_disable_intrs(ar);
+
+	crash_data = ath10k_coredump_new(ar);
+
+	if (crash_data)
+		scnprintf(guid, sizeof(guid), "%pUl", &crash_data->guid);
+	else
+		scnprintf(guid, sizeof(guid), "n/a");
+
+	ath10k_err(ar, "firmware crashed! (guid %s)\n", guid);
+	ath10k_print_driver_info(ar);
+	ath10k_sdio_dump_registers(ar, crash_data, fast_dump);
+	ath10k_sdio_dump_memory(ar, crash_data, fast_dump);
+
+	ath10k_sdio_hif_enable_intrs(ar);
+
+	queue_work(ar->workqueue, &ar->restart_work);
+}
+
 static int ath10k_sdio_probe(struct sdio_func *func,
 			     const struct sdio_device_id *id)
 {
@@ -2020,6 +2415,12 @@ static int ath10k_sdio_probe(struct sdio_func *func,
 		goto err_core_destroy;
 	}
 
+	ar_sdio->vsg_buffer = devm_kmalloc(ar->dev, ATH10K_SDIO_VSG_BUF_SIZE, GFP_KERNEL);
+	if (!ar_sdio->vsg_buffer) {
+		ret = -ENOMEM;
+		goto err_core_destroy;
+	}
+
 	ar_sdio->irq_data.irq_en_reg =
 		devm_kzalloc(ar->dev, sizeof(struct ath10k_sdio_irq_enable_regs),
 			     GFP_KERNEL);
@@ -2056,6 +2457,9 @@ static int ath10k_sdio_probe(struct sdio_func *func,
 
 	for (i = 0; i < ATH10K_SDIO_BUS_REQUEST_MAX_NUM; i++)
 		ath10k_sdio_free_bus_req(ar, &ar_sdio->bus_req[i]);
+
+	skb_queue_head_init(&ar_sdio->rx_head);
+	INIT_WORK(&ar_sdio->async_work_rx, ath10k_rx_indication_async_work);
 
 	dev_id_base = FIELD_GET(QCA_MANUFACTURER_ID_BASE, id->device);
 	switch (dev_id_base) {

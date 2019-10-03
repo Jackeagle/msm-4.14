@@ -25,6 +25,9 @@
 #include "wmi-ops.h"
 #include "wow.h"
 
+/* ms */
+#define ATH10K_SURVEY_INTERVAL 10000
+
 /*********/
 /* Rates */
 /*********/
@@ -986,8 +989,12 @@ static void ath10k_mac_vif_beacon_cleanup(struct ath10k_vif *arvif)
 	ath10k_mac_vif_beacon_free(arvif);
 
 	if (arvif->beacon_buf) {
-		dma_free_coherent(ar->dev, IEEE80211_MAX_FRAME_LEN,
-				  arvif->beacon_buf, arvif->beacon_paddr);
+		if (ar->dev_type == ATH10K_DEV_TYPE_HL)
+			kfree(arvif->beacon_buf);
+		else
+			dma_free_coherent(ar->dev, IEEE80211_MAX_FRAME_LEN,
+					  arvif->beacon_buf,
+					  arvif->beacon_paddr);
 		arvif->beacon_buf = NULL;
 	}
 }
@@ -5227,6 +5234,9 @@ static int ath10k_add_interface(struct ieee80211_hw *hw,
 	arvif->ar = ar;
 	arvif->vif = vif;
 
+	// assign type of the new interface to the parent type (SDIO, PCI, etc)
+	ar->dev_type = arvif->ar->bus_param.dev_type;
+
 	INIT_LIST_HEAD(&arvif->list);
 	INIT_WORK(&arvif->ap_csa_work, ath10k_mac_vif_ap_csa_work);
 	INIT_DELAYED_WORK(&arvif->connection_loss_work,
@@ -5330,10 +5340,17 @@ static int ath10k_add_interface(struct ieee80211_hw *hw,
 	if (vif->type == NL80211_IFTYPE_ADHOC ||
 	    vif->type == NL80211_IFTYPE_MESH_POINT ||
 	    vif->type == NL80211_IFTYPE_AP) {
-		arvif->beacon_buf = dma_alloc_coherent(ar->dev,
-						       IEEE80211_MAX_FRAME_LEN,
-						       &arvif->beacon_paddr,
-						       GFP_ATOMIC);
+		if (ar->dev_type == ATH10K_DEV_TYPE_HL) {
+			arvif->beacon_buf = kmalloc(IEEE80211_MAX_FRAME_LEN,
+						    GFP_KERNEL);
+			arvif->beacon_paddr = (dma_addr_t)arvif->beacon_buf;
+		} else {
+			arvif->beacon_buf =
+				dma_alloc_coherent(ar->dev,
+						   IEEE80211_MAX_FRAME_LEN,
+						   &arvif->beacon_paddr,
+						   GFP_ATOMIC);
+		}
 		if (!arvif->beacon_buf) {
 			ret = -ENOMEM;
 			ath10k_warn(ar, "failed to allocate beacon buffer: %d\n",
@@ -5547,8 +5564,12 @@ err_vdev_delete:
 
 err:
 	if (arvif->beacon_buf) {
-		dma_free_coherent(ar->dev, IEEE80211_MAX_FRAME_LEN,
-				  arvif->beacon_buf, arvif->beacon_paddr);
+		if (ar->dev_type == ATH10K_DEV_TYPE_HL)
+			kfree(arvif->beacon_buf);
+		else
+			dma_free_coherent(ar->dev, IEEE80211_MAX_FRAME_LEN,
+					  arvif->beacon_buf,
+					  arvif->beacon_paddr);
 		arvif->beacon_buf = NULL;
 	}
 
@@ -7242,6 +7263,55 @@ ath10k_mac_update_bss_chan_survey(struct ath10k *ar,
 		ath10k_warn(ar, "bss channel survey timed out\n");
 		return;
 	}
+}
+
+static void ath10k_request_survey(struct ath10k *ar)
+{
+	lockdep_assert_held(&ar->conf_mutex);
+
+	if (ar->state != ATH10K_STATE_ON)
+		return;
+
+	if (!ar->rx_channel)
+		return;
+
+	ath10k_mac_update_bss_chan_survey(ar, ar->rx_channel);
+}
+
+void ath10k_survey_dwork(struct work_struct *work)
+{
+	struct ath10k *ar = container_of(work, struct ath10k,
+					 survey_dwork.work);
+
+	mutex_lock(&ar->conf_mutex);
+	ath10k_request_survey(ar);
+	mutex_unlock(&ar->conf_mutex);
+
+	queue_delayed_work(ar->workqueue, &ar->survey_dwork,
+			   msecs_to_jiffies(ATH10K_SURVEY_INTERVAL));
+}
+
+int ath10k_survey_start(struct ath10k *ar)
+{
+	lockdep_assert_held(&ar->conf_mutex);
+
+	if (ar->hw_params.cc_wraparound_type != ATH10K_HW_CC_WRAP_SHIFTED_ALL)
+		return 0;
+
+	queue_delayed_work(ar->workqueue, &ar->survey_dwork,
+			   msecs_to_jiffies(ATH10K_SURVEY_INTERVAL));
+
+	return 0;
+}
+
+void ath10k_survey_stop(struct ath10k *ar)
+{
+	lockdep_assert_held(&ar->conf_mutex);
+
+	if (ar->hw_params.cc_wraparound_type != ATH10K_HW_CC_WRAP_SHIFTED_ALL)
+		return;
+
+	cancel_delayed_work_sync(&ar->survey_dwork);
 }
 
 static int ath10k_get_survey(struct ieee80211_hw *hw, int idx,
@@ -9008,6 +9078,18 @@ int ath10k_mac_register(struct ath10k *ar)
 				ARRAY_SIZE(ath10k_tlv_if_comb);
 		}
 		ar->hw->wiphy->interface_modes |= BIT(NL80211_IFTYPE_ADHOC);
+
+		if (test_bit
+		    (WMI_SERVICE_IFACE_COMBINATION_SUPPORT, ar->wmi.svc_map)) {
+			/**
+			 * If combo_sz is not ZERO, it means that host will use
+			 * iface_combinations reported from FW.
+			 */
+			if (ar->iface.combo_sz)
+				ath10k_iface_comb_assignment(ar);
+			else
+				ath10k_warn(ar, "iface combination event missing!\n");
+		}
 		break;
 	case ATH10K_FW_WMI_OP_VERSION_10_1:
 	case ATH10K_FW_WMI_OP_VERSION_10_2:

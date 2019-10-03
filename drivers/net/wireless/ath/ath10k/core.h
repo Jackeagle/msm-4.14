@@ -40,6 +40,9 @@
 #define ATH10K_NUM_CHANS 41
 #define ATH10K_MAX_5G_CHAN 173
 
+#define MAX_NUM_IFACE_COMBINATIONS  16
+#define BEACON_TX_OFFLOAD_MAX_VDEV  2
+
 /* Antenna noise floor */
 #define ATH10K_DEFAULT_NOISE_FLOOR -95
 
@@ -941,6 +944,13 @@ struct ath10k_bus_params {
 	bool hl_msdu_ids;
 };
 
+struct ath10k_iface_comb {
+	struct ieee80211_iface_combination combo[MAX_NUM_IFACE_COMBINATIONS];
+	u16 combo_sz;
+	u16 interface_modes;
+	u32 beacon_tx_offload_max_vdev;
+};
+
 struct ath10k {
 	struct ath_common ath_common;
 	struct ieee80211_hw *hw;
@@ -1136,6 +1146,9 @@ struct ath10k {
 	u32 survey_last_rx_clear_count;
 	u32 survey_last_cycle_count;
 	struct survey_info survey[ATH10K_NUM_CHANS];
+	u64 survey_last_total_cc[ATH10K_NUM_CHANS];
+	u64 survey_last_busy_cc[ATH10K_NUM_CHANS];
+	struct delayed_work survey_dwork;
 
 	/* Channel info events are expected to come in pairs without and with
 	 * COMPLETE flag set respectively for each channel visit during scan.
@@ -1220,9 +1233,35 @@ struct ath10k {
 	struct ath10k_bus_params bus_param;
 	struct completion peer_delete_done;
 
+	/* iface combination */
+	struct ath10k_iface_comb iface;
+
 	/* must be last */
 	u8 drv_priv[0] __aligned(sizeof(void *));
 };
+
+static inline void ath10k_init_iface_comb(struct ath10k *ar)
+{
+	memset(&ar->iface, 0, sizeof(struct ath10k_iface_comb));
+	ar->iface.beacon_tx_offload_max_vdev = BEACON_TX_OFFLOAD_MAX_VDEV;
+}
+
+static inline void ath10k_deinit_iface_comb(struct ath10k *ar)
+{
+	int i;
+
+	for (i = 0; i < ar->iface.combo_sz; i++) {
+		kfree(ar->iface.combo[i].limits);
+		ar->iface.combo[i].limits = NULL;
+	}
+}
+
+static inline void ath10k_iface_comb_assignment(struct ath10k *ar)
+{
+	ar->hw->wiphy->iface_combinations = ar->iface.combo;
+	ar->hw->wiphy->n_iface_combinations = ar->iface.combo_sz;
+	ar->hw->wiphy->interface_modes = ar->iface.interface_modes;
+}
 
 static inline bool ath10k_peer_stats_enabled(struct ath10k *ar)
 {

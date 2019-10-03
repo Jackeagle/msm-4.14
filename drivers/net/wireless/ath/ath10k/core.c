@@ -539,6 +539,33 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
 		.tx_stats_over_pktlog = false,
 	},
 	{
+		.id = QCA9377_HW_1_1_DEV_VERSION,
+		.dev_id = QCA9377_1_0_DEVICE_ID,
+		.bus = ATH10K_BUS_SDIO,
+		.name = "qca9377 hw1.1 sdio",
+		.patch_load_addr = QCA9377_HW_1_0_PATCH_LOAD_ADDR,
+		.uart_pin = 19,
+		.otp_exe_param = 0,
+		.channel_counters_freq_hz = 88000,
+		.max_probe_resp_desc_thres = 0,
+		.cal_data_len = 8124,
+		.fw = {
+			.dir = QCA9377_HW_1_0_FW_DIR,
+			.board = QCA9377_HW_1_0_BOARD_DATA_FILE,
+			.board_size = QCA9377_BOARD_DATA_SZ,
+			.board_ext_size = QCA9377_BOARD_EXT_DATA_SZ,
+		},
+		.hw_ops = &qca6174_ops,
+		.hw_clk = qca6174_clk,
+		.target_cpu_freq = 176000000,
+		.decap_align_bytes = 4,
+		.n_cipher_suites = 8,
+		.num_peers = TARGET_QCA9377_HL_NUM_PEERS,
+		.ast_skid_limit = 0x10,
+		.num_wds_entries = 0x20,
+		.uart_pin_workaround = true,
+	},
+	{
 		.id = QCA4019_HW_1_0_DEV_VERSION,
 		.dev_id = 0,
 		.bus = ATH10K_BUS_AHB,
@@ -722,6 +749,16 @@ static int ath10k_init_sdio(struct ath10k *ar, enum ath10k_firmware_mode mode)
 
 	param |= HI_OPTION_DISABLE_DBGLOG;
 	ret = ath10k_bmi_write32(ar, hi_option_flag, param);
+	if (ret)
+		return ret;
+
+	ret = ath10k_bmi_read32(ar, hi_option_flag2, &param);
+	if (ret)
+		return ret;
+
+	param |= HI_OPTION_SDIO_CRASH_DUMP_ENHANCEMENT_HOST;
+
+	ret = ath10k_bmi_write32(ar, hi_option_flag2, param);
 	if (ret)
 		return ret;
 
@@ -2814,8 +2851,14 @@ int ath10k_core_start(struct ath10k *ar, enum ath10k_firmware_mode mode,
 		goto err_hif_stop;
 	}
 
+	status = ath10k_survey_start(ar);
+	if (status)
+		goto err_debug_stop;
+
 	return 0;
 
+err_debug_stop:
+	ath10k_debug_stop(ar);
 err_hif_stop:
 	ath10k_hif_stop(ar);
 err_htt_rx_detach:
@@ -2855,6 +2898,7 @@ int ath10k_wait_for_suspend(struct ath10k *ar, u32 suspend_opt)
 void ath10k_core_stop(struct ath10k *ar)
 {
 	lockdep_assert_held(&ar->conf_mutex);
+	ath10k_survey_stop(ar);
 	ath10k_debug_stop(ar);
 
 	/* try to suspend target */
@@ -3205,6 +3249,7 @@ struct ath10k *ath10k_core_create(size_t priv_size, struct device *dev,
 	init_completion(&ar->peer_delete_done);
 
 	INIT_DELAYED_WORK(&ar->scan.timeout, ath10k_scan_timeout_work);
+	INIT_DELAYED_WORK(&ar->survey_dwork, ath10k_survey_dwork);
 
 	ar->workqueue = create_singlethread_workqueue("ath10k_wq");
 	if (!ar->workqueue)
@@ -3236,6 +3281,7 @@ struct ath10k *ath10k_core_create(size_t priv_size, struct device *dev,
 		  ath10k_core_set_coverage_class_work);
 
 	init_dummy_netdev(&ar->napi_dev);
+	ath10k_init_iface_comb(ar);
 
 	ret = ath10k_coredump_create(ar);
 	if (ret)
@@ -3274,6 +3320,7 @@ void ath10k_core_destroy(struct ath10k *ar)
 	ath10k_coredump_destroy(ar);
 	ath10k_htt_tx_destroy(&ar->htt);
 	ath10k_wmi_free_host_mem(ar);
+	ath10k_deinit_iface_comb(ar);
 	ath10k_mac_destroy(ar);
 }
 EXPORT_SYMBOL(ath10k_core_destroy);

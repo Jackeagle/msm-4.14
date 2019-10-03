@@ -5698,10 +5698,38 @@ static int ath10k_wmi_event_temperature(struct ath10k *ar, struct sk_buff *skb)
 	return 0;
 }
 
+static void ath10k_clean_survey(struct ath10k *ar, struct survey_info *survey,
+				int idx, u64 total, u64 busy)
+{
+	u32 total_diff;
+	u32 busy_diff;
+
+	lockdep_assert_held(&ar->data_lock);
+
+	if (ar->hw_params.cc_wraparound_type != ATH10K_HW_CC_WRAP_SHIFTED_ALL)
+		return;
+
+	if (total < ar->survey_last_total_cc[idx]) {
+		total_diff = total + 0x7fffffff - ar->survey_last_total_cc[idx];
+		busy_diff = 0;
+		survey->filled &= ~SURVEY_INFO_TIME_BUSY;
+	} else {
+		total_diff = total - ar->survey_last_total_cc[idx];
+		busy_diff = busy - ar->survey_last_busy_cc[idx];
+	}
+
+	survey->time      = CCNT_TO_MSEC(ar, total_diff);
+	survey->time_busy = CCNT_TO_MSEC(ar, busy_diff);
+
+	ar->survey_last_total_cc[idx] = total;
+	ar->survey_last_busy_cc[idx] = busy;
+}
+
 static int ath10k_wmi_event_pdev_bss_chan_info(struct ath10k *ar,
 					       struct sk_buff *skb)
 {
 	struct wmi_pdev_bss_chan_info_event *ev;
+	struct survey_info survey_tmp = {};
 	struct survey_info *survey;
 	u64 busy, total, tx, rx, rx_bss;
 	u32 freq, noise_floor;
@@ -5724,6 +5752,13 @@ static int ath10k_wmi_event_pdev_bss_chan_info(struct ath10k *ar,
 		   "wmi event pdev bss chan info:\n freq: %d noise: %d cycle: busy %llu total %llu tx %llu rx %llu rx_bss %llu\n",
 		   freq, noise_floor, busy, total, tx, rx, rx_bss);
 
+	/* everything zero means invalid data
+	 * -> drop it to avoid bogus noisefloor in survey report
+	 */
+	if (noise_floor == 0 && busy == 0 && total == 0 && tx == 0 && rx == 0 &&
+	    rx_bss == 0)
+		return -EPROTO;
+
 	spin_lock_bh(&ar->data_lock);
 	idx = freq_to_idx(ar, freq);
 	if (idx >= ARRAY_SIZE(ar->survey)) {
@@ -5732,18 +5767,29 @@ static int ath10k_wmi_event_pdev_bss_chan_info(struct ath10k *ar,
 		goto exit;
 	}
 
+	/* create delta result - might need fix of counters */
+	survey_tmp.noise     = noise_floor;
+	survey_tmp.time      = div_u64(total, cc_freq_hz);
+	survey_tmp.time_busy = div_u64(busy, cc_freq_hz);
+	survey_tmp.time_rx   = div_u64(rx_bss, cc_freq_hz);
+	survey_tmp.time_tx   = div_u64(tx, cc_freq_hz);
+	survey_tmp.filled    = (SURVEY_INFO_NOISE_DBM |
+				SURVEY_INFO_TIME |
+				SURVEY_INFO_TIME_BUSY |
+				SURVEY_INFO_TIME_RX |
+				SURVEY_INFO_TIME_TX);
+
+	ath10k_clean_survey(ar, &survey_tmp, idx, total, busy);
+
+	/* create accumulated result */
 	survey = &ar->survey[idx];
 
-	survey->noise     = noise_floor;
-	survey->time      = div_u64(total, cc_freq_hz);
-	survey->time_busy = div_u64(busy, cc_freq_hz);
-	survey->time_rx   = div_u64(rx_bss, cc_freq_hz);
-	survey->time_tx   = div_u64(tx, cc_freq_hz);
-	survey->filled   |= (SURVEY_INFO_NOISE_DBM |
-			     SURVEY_INFO_TIME |
-			     SURVEY_INFO_TIME_BUSY |
-			     SURVEY_INFO_TIME_RX |
-			     SURVEY_INFO_TIME_TX);
+	survey->noise      = survey_tmp.noise;
+	survey->time      += survey_tmp.time;
+	survey->time_busy += survey_tmp.time_busy;
+	survey->time_rx   += survey_tmp.time_rx;
+	survey->time_tx   += survey_tmp.time_tx;
+	survey->filled    |= survey_tmp.filled;
 exit:
 	spin_unlock_bh(&ar->data_lock);
 	complete(&ar->bss_survey_done);
