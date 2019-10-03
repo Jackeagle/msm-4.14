@@ -2814,8 +2814,14 @@ int ath10k_core_start(struct ath10k *ar, enum ath10k_firmware_mode mode,
 		goto err_hif_stop;
 	}
 
+	status = ath10k_survey_start(ar);
+	if (status)
+		goto err_debug_stop;
+
 	return 0;
 
+err_debug_stop:
+	ath10k_debug_stop(ar);
 err_hif_stop:
 	ath10k_hif_stop(ar);
 err_htt_rx_detach:
@@ -2855,6 +2861,7 @@ int ath10k_wait_for_suspend(struct ath10k *ar, u32 suspend_opt)
 void ath10k_core_stop(struct ath10k *ar)
 {
 	lockdep_assert_held(&ar->conf_mutex);
+	ath10k_survey_stop(ar);
 	ath10k_debug_stop(ar);
 
 	/* try to suspend target */
@@ -3205,6 +3212,7 @@ struct ath10k *ath10k_core_create(size_t priv_size, struct device *dev,
 	init_completion(&ar->peer_delete_done);
 
 	INIT_DELAYED_WORK(&ar->scan.timeout, ath10k_scan_timeout_work);
+	INIT_DELAYED_WORK(&ar->survey_dwork, ath10k_survey_dwork);
 
 	ar->workqueue = create_singlethread_workqueue("ath10k_wq");
 	if (!ar->workqueue)

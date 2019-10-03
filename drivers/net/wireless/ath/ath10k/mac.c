@@ -25,6 +25,9 @@
 #include "wmi-ops.h"
 #include "wow.h"
 
+/* ms */
+#define ATH10K_SURVEY_INTERVAL 10000
+
 /*********/
 /* Rates */
 /*********/
@@ -7257,6 +7260,55 @@ ath10k_mac_update_bss_chan_survey(struct ath10k *ar,
 		ath10k_warn(ar, "bss channel survey timed out\n");
 		return;
 	}
+}
+
+static void ath10k_request_survey(struct ath10k *ar)
+{
+	lockdep_assert_held(&ar->conf_mutex);
+
+	if (ar->state != ATH10K_STATE_ON)
+		return;
+
+	if (!ar->rx_channel)
+		return;
+
+	ath10k_mac_update_bss_chan_survey(ar, ar->rx_channel);
+}
+
+void ath10k_survey_dwork(struct work_struct *work)
+{
+	struct ath10k *ar = container_of(work, struct ath10k,
+					 survey_dwork.work);
+
+	mutex_lock(&ar->conf_mutex);
+	ath10k_request_survey(ar);
+	mutex_unlock(&ar->conf_mutex);
+
+	queue_delayed_work(ar->workqueue, &ar->survey_dwork,
+			   msecs_to_jiffies(ATH10K_SURVEY_INTERVAL));
+}
+
+int ath10k_survey_start(struct ath10k *ar)
+{
+	lockdep_assert_held(&ar->conf_mutex);
+
+	if (ar->hw_params.cc_wraparound_type != ATH10K_HW_CC_WRAP_SHIFTED_ALL)
+		return 0;
+
+	queue_delayed_work(ar->workqueue, &ar->survey_dwork,
+			   msecs_to_jiffies(ATH10K_SURVEY_INTERVAL));
+
+	return 0;
+}
+
+void ath10k_survey_stop(struct ath10k *ar)
+{
+	lockdep_assert_held(&ar->conf_mutex);
+
+	if (ar->hw_params.cc_wraparound_type != ATH10K_HW_CC_WRAP_SHIFTED_ALL)
+		return;
+
+	cancel_delayed_work_sync(&ar->survey_dwork);
 }
 
 static int ath10k_get_survey(struct ieee80211_hw *hw, int idx,

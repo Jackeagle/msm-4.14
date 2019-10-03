@@ -1138,6 +1138,7 @@ struct ath10k {
 	struct survey_info survey[ATH10K_NUM_CHANS];
 	u64 survey_last_total_cc[ATH10K_NUM_CHANS];
 	u64 survey_last_busy_cc[ATH10K_NUM_CHANS];
+	struct delayed_work survey_dwork;
 
 	/* Channel info events are expected to come in pairs without and with
 	 * COMPLETE flag set respectively for each channel visit during scan.
