@@ -551,9 +551,10 @@ void ath10k_hw_fill_survey_time(struct ath10k *ar, struct survey_info *survey,
 	u32 cc_fix = 0;
 	u32 rcc_fix = 0;
 	enum ath10k_hw_cc_wraparound_type wraparound_type;
+	u32 filled = 0;
 
-	survey->filled |= SURVEY_INFO_TIME |
-			  SURVEY_INFO_TIME_BUSY;
+	filled |= SURVEY_INFO_TIME |
+		  SURVEY_INFO_TIME_BUSY;
 
 	wraparound_type = ar->hw_params.cc_wraparound_type;
 
@@ -562,7 +563,7 @@ void ath10k_hw_fill_survey_time(struct ath10k *ar, struct survey_info *survey,
 		case ATH10K_HW_CC_WRAP_SHIFTED_ALL:
 			if (cc < cc_prev) {
 				cc_fix = 0x7fffffff;
-				survey->filled &= ~SURVEY_INFO_TIME_BUSY;
+				filled &= ~SURVEY_INFO_TIME_BUSY;
 			}
 			break;
 		case ATH10K_HW_CC_WRAP_SHIFTED_EACH:
@@ -580,8 +581,10 @@ void ath10k_hw_fill_survey_time(struct ath10k *ar, struct survey_info *survey,
 	cc -= cc_prev - cc_fix;
 	rcc -= rcc_prev - rcc_fix;
 
-	survey->time = CCNT_TO_MSEC(ar, cc);
-	survey->time_busy = CCNT_TO_MSEC(ar, rcc);
+	survey->filled |= filled;
+	survey->time += CCNT_TO_MSEC(ar, cc);
+	if (survey->filled & SURVEY_INFO_TIME_BUSY)
+		survey->time_busy += CCNT_TO_MSEC(ar, rcc);
 }
 
 /* The firmware does not support setting the coverage class. Instead this
